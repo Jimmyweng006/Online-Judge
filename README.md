@@ -1,4 +1,4 @@
-# Online Judge
+# Online-Judge
 > This project is base on [Knight Online Judge](https://github.com/sinmaplewing/knight-online-judge-backend-server)
 
 ## Architecture 
