@@ -42,6 +42,7 @@ dependencies {
     implementation("org.postgresql:postgresql:42.2.16")
     implementation("at.favre.lib:bcrypt:0.9.0")
     implementation("io.ktor:ktor-auth:$ktor_version")
+    implementation("redis.clients:jedis:3.3.0")
 }
 
 kotlin.sourceSets["main"].kotlin.srcDirs("src")

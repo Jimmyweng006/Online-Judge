@@ -1,6 +1,7 @@
 package com.example
 
 import com.fasterxml.jackson.databind.SerializationFeature
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.application.*
@@ -16,9 +17,11 @@ import io.ktor.jackson.*
 import io.ktor.sessions.*
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
+import redis.clients.jedis.Jedis
 
 const val NORMAL_USER_AUTHENTICAION_NAME = "Normal User"
 const val SUPER_USER_AUTHENTICATION_NAME = "Super User"
+const val SUBMISSION_NO_RESULT = "-"
 
 fun main(args: Array<String>): Unit = io.ktor.server.netty.EngineMain.main(args)
 
@@ -37,6 +40,8 @@ fun initDatabase() {
 @kotlin.jvm.JvmOverloads
 fun Application.module(testing: Boolean = false) {
     initDatabase()
+
+    var jedis: Jedis? = Jedis()
 
     val client = HttpClient(Apache) {
     }
@@ -335,6 +340,7 @@ fun Application.module(testing: Boolean = false) {
                     val userIdAuthorityPrincipal = call.sessions.get<UserIdAuthorityPrincipal>()
                     val userId = userIdAuthorityPrincipal?.userId
                     var submissionId: Int? = null
+                    var testCaseData: List<JudgerTestCaseData>? = null
 
                     // does not need?
                     if (userId == null) throw UnauthorizedException()
@@ -348,11 +354,107 @@ fun Application.module(testing: Boolean = false) {
                             it[problemId] = submissionData.problemId
                             it[SubmissionTable.userId] = userId.toInt()
                         } get SubmissionTable.id
+
+                        testCaseData = TestCaseTable.select {
+                            TestCaseTable.problemId.eq(submissionData.problemId)
+                        }.map {
+                            JudgerTestCaseData(
+                                it[TestCaseTable.input],
+                                it[TestCaseTable.expectedOutput],
+                                it[TestCaseTable.score],
+                                it[TestCaseTable.timeOutSeconds]
+                            )
+                        }.toList()
+                    }
+
+                    val judgerSubmissionId: Int? = submissionId
+                    val judgerTestCaseData: List<JudgerTestCaseData>? = testCaseData
+                    if (judgerSubmissionId != null && judgerTestCaseData != null) {
+                        val judgerSubmissionData = JudgerSubmissionData(
+                            judgerSubmissionId,
+                            submissionData.language,
+                            submissionData.code,
+                            judgerTestCaseData
+                        )
+
+                        try {
+                            jedis = jedis.getConnection()
+                            val currentJedisConnection: Jedis = jedis!!
+                            currentJedisConnection.rpush(
+                                submissionData.language,
+                                jacksonObjectMapper().writeValueAsString(judgerSubmissionData)
+                            )
+                            currentJedisConnection.disconnect()
+                        } catch (e: Exception) {
+                            jedis?.disconnect()
+                            jedis = null
+                            println(e)
+                        }
                     }
 
                     call.respond(mapOf(
                         "submission_id" to submissionId
                     ))
+                }
+
+                authenticate(SUPER_USER_AUTHENTICATION_NAME) {
+                    post("/restart") {
+                        var unjudgedSubmissionData: List<JudgerSubmissionData>? = null
+                        var isOK = true
+
+                        // 尋找未審核的程式碼資料
+                        transaction {
+                            unjudgedSubmissionData =
+                                SubmissionTable.select {
+                                    SubmissionTable.result.eq(SUBMISSION_NO_RESULT)
+                                }.map {
+                                    val testCaseData = TestCaseTable.select {
+                                        TestCaseTable.problemId.eq(it[SubmissionTable.problemId])
+                                    }.map {
+                                        JudgerTestCaseData(
+                                            it[TestCaseTable.input],
+                                            it[TestCaseTable.expectedOutput],
+                                            it[TestCaseTable.score],
+                                            it[TestCaseTable.timeOutSeconds]
+                                        )
+                                    }
+
+                                    JudgerSubmissionData(
+                                        it[SubmissionTable.id],
+                                        it[SubmissionTable.language],
+                                        it[SubmissionTable.code],
+                                        testCaseData
+                                    )
+                                }.toList()
+                        }
+
+                        // 將資料丟入 Redis 資料庫中
+                        val judgerSubmissionDataList = unjudgedSubmissionData
+                        if (judgerSubmissionDataList != null) {
+                            for (judgerSubmissionData in judgerSubmissionDataList) {
+                                try {
+                                    jedis = jedis.getConnection()
+                                    val currentJedisConnection: Jedis = jedis!!
+                                    currentJedisConnection.rpush(
+                                        judgerSubmissionData.language,
+                                        jacksonObjectMapper().writeValueAsString(judgerSubmissionData)
+                                    )
+                                } catch (e: Exception){
+                                    jedis?.disconnect()
+                                    jedis = null
+                                    println(e)
+
+                                    // 紀錄是否出現錯誤
+                                    isOK = false
+                                }
+                            }
+                        }
+
+                        // 回傳是否有成功
+                        call.respond(mapOf(
+                            "OK" to isOK
+                        ))
+                    }
                 }
 
                 route("/{id}") {
@@ -386,6 +488,71 @@ fun Application.module(testing: Boolean = false) {
 
                         call.respond(mapOf(
                             "data" to responseData
+                        ))
+                    }
+
+                    post("/restart") {
+                        val requestId = call.parameters["id"]?.toInt() ?:
+                        throw BadRequestException("The type of Id is wrong.")
+                        var unjudgedSubmissionData: JudgerSubmissionData? = null
+                        var isOK = true
+                        val userIdAuthorityPrincipal = call.sessions.get<UserIdAuthorityPrincipal>()
+                        val userId = userIdAuthorityPrincipal?.userId ?: throw UnauthorizedException()
+
+                        transaction {
+                            val submissionData =
+                                SubmissionTable.select {
+                                    SubmissionTable.id.eq(requestId)
+                                }.first()
+
+                            // 非該用戶所遞交的程式碼，直接丟入 UnauthorizedException
+                            if (submissionData[SubmissionTable.userId] != userId.toInt()) {
+                                throw UnauthorizedException()
+                            }
+
+                            val testCaseData =
+                                TestCaseTable.select {
+                                    TestCaseTable.problemId.eq(submissionData[SubmissionTable.problemId])
+                                }.map {
+                                    JudgerTestCaseData(
+                                        it[TestCaseTable.input],
+                                        it[TestCaseTable.expectedOutput],
+                                        it[TestCaseTable.score],
+                                        it[TestCaseTable.timeOutSeconds]
+                                    )
+                                }
+
+                            unjudgedSubmissionData = JudgerSubmissionData(
+                                submissionData[SubmissionTable.id],
+                                submissionData[SubmissionTable.language],
+                                submissionData[SubmissionTable.code],
+                                testCaseData
+                            )
+                        }
+
+                        // 將資料丟入 Redis 資料庫中
+                        val judgerSubmissionData = unjudgedSubmissionData
+                        if (judgerSubmissionData != null) {
+                            try {
+                                jedis = jedis.getConnection()
+                                val currentJedisConnection: Jedis = jedis!!
+                                currentJedisConnection.rpush(
+                                    judgerSubmissionData.language,
+                                    jacksonObjectMapper().writeValueAsString(judgerSubmissionData)
+                                )
+                            } catch (e: Exception) {
+                                println(e)
+                                jedis?.disconnect()
+                                jedis = null
+
+                                // 紀錄是否出現錯誤
+                                isOK = false
+                            }
+                        }
+
+                        // 回傳是否有成功
+                        call.respond(mapOf(
+                            "OK" to isOK
                         ))
                     }
                 }
